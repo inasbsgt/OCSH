@@ -812,3 +812,731 @@ static int exec_statement(const char *stmt)
     free(e);
     return last_status = st;                    // $? = code de cette commande
 }
+/* =====================================================================
+ *                         PARTIE 2  (jalons 4, 5, 6)
+ *   Variables et expansion, $(...) et `...`, .ocshrc, historique,
+ *   complétion, mode script (if / for / while), programme principal
+ * ===================================================================== */
+
+/* ---------- 2.A  Variables du shell (jalon 4) ---------- */
+
+/* Une variable : un nom, une valeur, et un drapeau "exportée". */
+typedef struct {
+    char *name, *value;
+    int exported;      // 1 : copiée dans l'environnement (visible des programmes lancés)
+} Var;
+static Var vars[MAX_VARS];
+static int nvars = 0;
+
+/* Cherche une variable par son nom (NULL si absente). */
+static Var *var_find(const char *name)
+{
+    for (int i = 0; i < nvars; i++)
+        if (!strcmp(vars[i].name, name))
+            return &vars[i];
+    return NULL;
+}
+/* Valeur d'une variable : table du shell, sinon environnement, sinon "". */
+static const char *var_get(const char *name)
+{
+    Var *v = var_find(name);
+    if (v) return v->value;
+    const char *env = getenv(name);    // ex. HOME, PATH viennent de l'environnement
+    return env ? env : "";
+}
+/* Crée ou modifie une variable. exported = 1 pour la rendre visible aux programmes. */
+static void var_set(const char *name, const char *value, int exported)
+{
+    Var *v = var_find(name);
+    if (!v) {                                    // nouvelle variable
+        if (nvars >= MAX_VARS) { fprintf(stderr, "ocsh: trop de variables\n"); return; }
+        v = &vars[nvars++];
+        v->name = xstrdup(name);
+        v->value = NULL;
+        v->exported = 0;
+    }
+    free(v->value);                              // libère l'ancienne valeur
+    v->value = xstrdup(value);
+    if (exported) v->exported = 1;
+    if (v->exported) setenv(name, value, 1);     // copie dans l'environnement (hérité par exec)
+}
+/* Builtin export :  export NOM=valeur   ou   export NOM  */
+static void var_export_words(Command *c)
+{
+    for (int i = 1; i < c->argc; i++) {
+        char *eq = is_assignment(c->argv[i]);
+        if (eq) {                                // NOM=valeur
+            *eq = '\0';
+            var_set(c->argv[i], eq + 1, 1);
+        } else {                                 // NOM seul : on exporte la valeur actuelle
+            var_set(c->argv[i], var_get(c->argv[i]), 1);
+        }
+    }
+}
+
+/* ---------- 2.B  Substitution de commande $(...) (jalon 5) ---------- */
+
+/* Exécute cmd dans un ENFANT dont la sortie est reliée à un pipe, lit le pipe
+ * et renvoie le texte produit (sans les retours à la ligne finaux). */
+static char *command_subst(const char *cmd)
+{
+    fflush(NULL);
+    int fd[2];
+    if (pipe(fd) < 0) { perror("pipe"); return xstrdup(""); }
+    sigset_t old;
+    sigprocmask(SIG_BLOCK, &chld_set, &old);     
+    pid_t pid = fork();
+    if (pid == 0) {                              
+        interactive = 0;                         
+        signal(SIGINT, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        close(fd[0]);                            // l'enfant n'a pas besoin du bout de lecture
+        dup2(fd[1], 1);                          // sa sortie standard va dans le pipe
+        close(fd[1]);
+        run_source(cmd);                         // exécute la commande
+        fflush(stdout);
+        _exit(last_status);
+    }
+    close(fd[1]);                                // PARENT : ferme le bout d'écriture (sinon EOF jamais vu)
+    Buf out = {0};
+    char tmp[512];
+    ssize_t r;
+    while ((r = read(fd[0], tmp, sizeof tmp)) > 0 || (r < 0 && errno == EINTR))
+        if (r > 0) buf_addn(&out, tmp, (size_t)r);   // lit tout ce que l'enfant a écrit
+    close(fd[0]);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    char *res = buf_take(&out);
+    size_t l = strlen(res);
+    while (l && res[l - 1] == '\n') res[--l] = '\0';  
+    return res;
+}
+
+/* ---------- 2.C  Expansion des variables (jalon 4) ---------- */
+
+/* expand : parcourt le texte et remplace
+ *   $NOM  ${NOM}  $?  $!  $$   par leur valeur,
+ *   $(cmd)  et  `cmd`          par la sortie de cmd.
+ * Règles de guillemets : '...' = rien n'est remplacé ; "..." = remplacé.
+ * Les guillemets sont CONSERVÉS ici : parse_word les enlèvera plus tard.
+ * L'expansion se fait au DERNIER moment (à chaque exécution), donc dans une
+ * boucle, $x prend la valeur courante à chaque tour. */
+static char *expand(const char *in)
+{
+    Buf out = {0};
+    int in_dq = 0;                               // 1 si on est dans des "..."
+    const char *p = in;
+    while (*p) {
+        char c = *p;
+        if (c == '\\' && p[1]) {                 // \x : on garde tel quel (parse_word gèrera)
+            buf_addc(&out, c); buf_addc(&out, p[1]); p += 2;
+        } else if (c == '\'' && !in_dq) {        // '...' : copie sans rien remplacer
+            const char *end = strchr(p + 1, '\'');
+            size_t len = end ? (size_t)(end - p) + 1 : strlen(p);
+            buf_addn(&out, p, len);
+            p += len;
+        } else if (c == '"') {                   // ouvre/ferme les guillemets doubles
+            in_dq = !in_dq; buf_addc(&out, c); p++;
+        } else if (c == '$' && p[1] == '(') {    // $(commande)
+            int depth = 1;
+            const char *q = p + 2;
+            while (*q && depth) {                // cherche la ')' qui correspond
+                if (*q == '(') depth++;
+                else if (*q == ')') depth--;
+                q++;
+            }
+            char *inner = slice(p + 2, (size_t)(q - (p + 2)) - (depth == 0 ? 1 : 0));
+            char *res = command_subst(inner);    // exécute et récupère la sortie
+            buf_add(&out, res);
+            free(res); free(inner);
+            p = q;
+        } else if (c == '`') {                   // `commande`
+            const char *q = strchr(p + 1, '`');
+            size_t len = q ? (size_t)(q - (p + 1)) : strlen(p + 1);
+            char *inner = slice(p + 1, len);
+            char *res = command_subst(inner);
+            buf_add(&out, res);
+            free(res); free(inner);
+            p += len + (q ? 2 : 1);
+        } else if (c == '$' && p[1] == '{') {    // ${NOM}
+            const char *q = strchr(p + 2, '}');
+            if (!q) { buf_addc(&out, c); p++; continue; }   // pas de '}' : '$' littéral
+            char *name = slice(p + 2, (size_t)(q - (p + 2)));
+            buf_add(&out, var_get(name));
+            free(name);
+            p = q + 1;
+        } else if (c == '$' && (p[1] == '?' || p[1] == '!' || p[1] == '$')) {   // $? $! $$
+            char num[32];
+            int v = p[1] == '?' ? last_status : p[1] == '!' ? (int)last_bg : (int)getpid();
+            snprintf(num, sizeof num, "%d", v);
+            buf_add(&out, num);
+            p += 2;
+        } else if (c == '$' && (isalpha((unsigned char)p[1]) || p[1] == '_')) {  // $NOM
+            const char *q = p + 1;
+            while (isalnum((unsigned char)*q) || *q == '_') q++;   // le nom s'arrête au 1er caractère interdit
+            char *name = slice(p + 1, (size_t)(q - (p + 1)));
+            buf_add(&out, var_get(name));
+            free(name);
+            p = q;
+        } else {                                 // caractère ordinaire : copié tel quel
+            buf_addc(&out, c);
+            p++;
+        }
+    }
+    return buf_take(&out);
+}
+
+/* ---------- 2.D  Historique (jalon 5) ---------- */
+
+static char *hist[MAX_HIST];   // les commandes déjà tapées
+static int hist_n = 0;         // combien il y en a
+
+static void history_add(const char *line)
+{
+    if (!*line) return;                                  // ligne vide : ignorée
+    if (hist_n && !strcmp(hist[hist_n - 1], line)) return;   // même que la précédente : ignorée
+    if (hist_n == MAX_HIST) {                            // plein : on oublie la plus ancienne
+        free(hist[0]);
+        memmove(hist, hist + 1, (MAX_HIST - 1) * sizeof hist[0]);
+        hist_n--;
+    }
+    hist[hist_n++] = xstrdup(line);
+}
+static void history_print(void)                          // builtin "past"
+{
+    for (int i = 0; i < hist_n; i++)
+        printf("%4d  %s\n", i + 1, hist[i]);
+}
+/* Chemin d'un fichier dans $HOME (renvoie NULL si HOME est vide). Libérer avec free. */
+static char *home_file(const char *name)
+{
+    const char *home = var_get("HOME");
+    if (!*home) return NULL;
+    Buf b = {0};
+    buf_add(&b, home);
+    buf_addc(&b, '/');
+    buf_add(&b, name);
+    return buf_take(&b);
+}
+static void history_load(void)                           // relit ~/.ocsh_history
+{
+    char *path = home_file(".ocsh_history");
+    FILE *f = path ? fopen(path, "r") : NULL;
+    if (f) {
+        char *line = NULL;
+        size_t cap = 0;
+        ssize_t r;
+        while ((r = getline(&line, &cap, f)) > 0) {      // getline alloue la ligne pour nous
+            if (line[r - 1] == '\n') line[r - 1] = '\0';
+            history_add(line);
+        }
+        free(line);
+        fclose(f);
+    }
+    free(path);
+}
+static void history_save(void)                           // sauvegarde dans ~/.ocsh_history
+{
+    char *path = home_file(".ocsh_history");
+    FILE *f = path ? fopen(path, "w") : NULL;
+    if (f) {
+        for (int i = 0; i < hist_n; i++)
+            fprintf(f, "%s\n", hist[i]);
+        fclose(f);
+    }
+    free(path);
+}
+
+/* ---------- 2.E  Saisie au clavier : flèches et complétion Tab (jalon 5) ---------- */
+
+/* Ajoute une proposition de complétion si elle commence par prefix. */
+static void cand_add(char **cand, int *nc, const char *full, const char *prefix, const char *suffix)
+{
+    if (*nc >= MAX_CAND || strncmp(full, prefix, strlen(prefix)) != 0) return;
+    Buf b = {0};
+    buf_add(&b, full);
+    buf_add(&b, suffix);
+    cand[(*nc)++] = buf_take(&b);
+}
+
+/* Complétion : quand on appuie sur Tab, on regarde le dernier mot tapé.
+ *   - premier mot  -> noms de nos commandes (builtins + alias)
+ *   - sinon        -> fichiers/dossiers du dossier concerné
+ * 1 seule proposition : on complète. Plusieurs : on complète le début commun,
+ * et si rien n'avance, on affiche la liste. */
+static void complete(char *buf, int *len)
+{
+    int start = *len;
+    while (start > 0 && buf[start - 1] != ' ') start--;   // début du dernier mot
+    char *word = slice(buf + start, (size_t)(*len - start));
+    int first = 1;                                        // est-ce le premier mot ?
+    for (int i = 0; i < start; i++)
+        if (buf[i] != ' ') first = 0;
+    char *cand[MAX_CAND];
+    int nc = 0;
+
+    if (first && !strchr(word, '/')) {                    // commandes
+        for (int i = 0; builtins[i]; i++) cand_add(cand, &nc, builtins[i], word, " ");
+        for (size_t i = 0; i < N_ALIASES; i++) cand_add(cand, &nc, aliases[i][0], word, " ");
+    }
+    /* fichiers : on sépare "dossier/préfixe" au dernier '/' */
+    char *slash = strrchr(word, '/');
+    char *dir = slash ? slice(word, (size_t)(slash - word) + 1) : xstrdup("");  // "src/" ou ""
+    const char *prefix = slash ? slash + 1 : word;
+    if (!first || slash) {
+        DIR *d = opendir(*dir ? dir : ".");
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d))) {                   // un tour par fichier du dossier
+                if (de->d_name[0] == '.' && prefix[0] != '.') continue;   // fichiers cachés : seulement si demandés
+                Buf full = {0};
+                buf_add(&full, dir);
+                buf_add(&full, de->d_name);
+                struct stat sb;
+                int isdir = stat(full.s, &sb) == 0 && S_ISDIR(sb.st_mode);
+                char *name = buf_take(&full);
+                if (!strncmp(de->d_name, prefix, strlen(prefix)))
+                    cand_add(cand, &nc, name, name, isdir ? "/" : " ");   // dossier -> "/", fichier -> espace
+                free(name);
+            }
+            closedir(d);
+        }
+    }
+    if (nc == 1) {                                        // une seule proposition : on complète
+        if (start + (int)strlen(cand[0]) < MAX_LINE) {
+            strcpy(buf + start, cand[0]);
+            *len = start + (int)strlen(cand[0]);
+        }
+    } else if (nc > 1) {                                  // plusieurs : début commun
+        size_t common = strlen(cand[0]);
+        for (int i = 1; i < nc; i++) {
+            size_t k = 0;
+            while (k < common && cand[i][k] == cand[0][k]) k++;
+            common = k;
+        }
+        if (common > strlen(word) && start + (int)common < MAX_LINE) {
+            memcpy(buf + start, cand[0], common);         // on avance jusqu'au début commun
+            *len = start + (int)common;
+            buf[*len] = '\0';
+        } else {                                          // rien à avancer : on liste
+            putchar('\n');
+            for (int i = 0; i < nc; i++) printf("%s  ", cand[i]);
+            putchar('\n');
+        }
+    }
+    for (int i = 0; i < nc; i++) free(cand[i]);
+    free(dir);
+    free(word);
+}
+
+/* Compte les CARACTÈRES (pas les octets) de buf[from..to-1] : un accent UTF-8
+ * occupe 2 octets mais 1 seule colonne à l'écran. Les octets de continuation
+ * (de la forme 10xxxxxx) ne comptent pas. Sert à replacer le curseur. */
+static int nb_cols(const char *buf, int from, int to)
+{
+    int n = 0;
+    for (int i = from; i < to; i++)
+        if (((unsigned char)buf[i] & 0xC0) != 0x80) n++;
+    return n;
+}
+
+/* Lecture d'une ligne au clavier, touche par touche.
+ * On désactive le mode "canonique" (ICANON) et l'écho du terminal pour recevoir
+ * chaque touche tout de suite (nécessaire pour Tab et les flèches). ISIG reste
+ * actif : Ctrl+C envoie toujours SIGINT. Renvoie NULL pour Ctrl+D (fin) ou
+ * Ctrl+C (alors interrupted vaut 1). */
+static char *read_line(const char *prompt)
+{
+    struct termios orig, raw;
+    tcgetattr(STDIN_FILENO, &orig);                       // sauvegarde les réglages du terminal
+    raw = orig;
+    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);            // plus de ligne entière, plus d'écho
+    raw.c_cc[VMIN] = 1;                                   // read rend la main dès 1 caractère
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    char buf[MAX_LINE] = "", saved[MAX_LINE] = "";
+    int len = 0, hpos = hist_n;                           // hpos : position dans l'historique
+    int pos = 0;                                          // pos : position du curseur dans buf (0 = début, len = fin)
+    char *result = NULL;
+    for (;;) {
+        printf("\r\x1b[2K%s%s", prompt, buf);             // efface la ligne et la redessine
+        int back = nb_cols(buf, pos, len);                // combien de caractères entre le curseur et la fin ?
+        if (back > 0) printf("\x1b[%dD", back);           // on ramène le curseur à sa place (ESC [ n D = n colonnes à gauche)
+        fflush(stdout);
+        unsigned char c;
+        ssize_t r = read(STDIN_FILENO, &c, 1);            // lit UNE touche
+        if (r < 0) {
+            if (errno == EINTR && interrupted) { printf("^C\n"); break; }  // Ctrl+C
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) break;                                // fin d'entrée
+        if (c == '\n') { putchar('\n'); result = xstrdup(buf); break; }    // Entrée
+        if (c == 4) {                                     // Ctrl+D
+            if (len == 0) { putchar('\n'); break; }       // ligne vide : fin du shell
+            continue;
+        }
+        if (c == 127 || c == 8) {                          // Retour arrière : efface le caractère AVANT le curseur
+            if (pos > 0) {
+                int start = pos - 1;
+                while (start > 0 && ((unsigned char)buf[start] & 0xC0) == 0x80) start--;   // recule jusqu'au début du caractère (accent = 2 octets)
+                memmove(buf + start, buf + pos, (size_t)(len - pos + 1));                  // décale la fin de la ligne vers la gauche ('\0' compris)
+                len -= pos - start;
+                pos = start;
+            }
+        }
+        else if (c == '\t') { complete(buf, &len); pos = len; }            // Tab (la complétion se fait en fin de ligne)
+        else if (c == 27) {                                // Échap : début d'une flèche (ESC [ A)
+            unsigned char s1 = 0, s2 = 0;
+            if (read(STDIN_FILENO, &s1, 1) <= 0 || read(STDIN_FILENO, &s2, 1) <= 0) continue;
+            if (s1 == '[' && s2 == 'D') {                  // flèche GAUCHE : curseur d'un caractère vers le début
+                if (pos > 0) {
+                    pos--;
+                    while (pos > 0 && ((unsigned char)buf[pos] & 0xC0) == 0x80) pos--;   // saute les octets d'un accent
+                }
+            } else if (s1 == '[' && s2 == 'C') {           // flèche DROITE : curseur d'un caractère vers la fin
+                if (pos < len) {
+                    pos++;
+                    while (pos < len && ((unsigned char)buf[pos] & 0xC0) == 0x80) pos++;
+                }
+            } else if (s1 == '[' && s2 == '3') {           // touche Suppr : ESC [ 3 ~ (on lit le '~' final)
+                unsigned char tilde;
+                if (read(STDIN_FILENO, &tilde, 1) > 0 && pos < len) {
+                    int end = pos + 1;
+                    while (end < len && ((unsigned char)buf[end] & 0xC0) == 0x80) end++;   // fin du caractère sous le curseur
+                    memmove(buf + pos, buf + end, (size_t)(len - end + 1));                // efface-le
+                    len -= end - pos;
+                }
+            } else if (s1 == '[' && s2 == 'A' && hpos > 0) {      // flèche haut : commande précédente
+                if (hpos == hist_n) strcpy(saved, buf);    // garde ce qu'on tapait
+                hpos--;
+                strncpy(buf, hist[hpos], MAX_LINE - 1);
+                buf[MAX_LINE - 1] = '\0';
+                len = (int)strlen(buf);
+                pos = len;                                 // curseur en fin de ligne
+            } else if (s1 == '[' && s2 == 'B' && hpos < hist_n) {   // flèche bas : suivante
+                hpos++;
+                strncpy(buf, hpos == hist_n ? saved : hist[hpos], MAX_LINE - 1);
+                buf[MAX_LINE - 1] = '\0';
+                len = (int)strlen(buf);
+                pos = len;                                 // curseur en fin de ligne
+            }
+        } else if (c >= 32 && len < MAX_LINE - 1) {       // caractère normal (accents UTF-8 inclus)
+            memmove(buf + pos + 1, buf + pos, (size_t)(len - pos + 1));   // fait de la place au curseur ('\0' compris)
+            buf[pos++] = (char)c;                          // insère le caractère, le curseur avance
+            len++;
+        }
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig);              // IMPORTANT : on rend le terminal normal
+    return result;
+}
+
+/* ---------- 2.F  Découpage en instructions et blocs if/for/while (jalon 6) ---------- */
+
+static void stmts_append(Stmts *s, char *owned)
+{
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        s->v = xrealloc(s->v, (size_t)s->cap * sizeof *s->v);
+    }
+    s->v[s->n++] = owned;
+}
+/* Ajoute une instruction (espaces retirés). Si elle commence par then/else/do
+ * suivi d'une commande ("then say yes"), on sépare : "then" puis "say yes".
+ * Ainsi les blocs sont toujours "mot-clé seul" + instructions. */
+static void stmts_push(Stmts *s, const char *text)
+{
+    while (isspace((unsigned char)*text)) text++;
+    size_t l = strlen(text);
+    while (l && isspace((unsigned char)text[l - 1])) l--;
+    if (!l) return;                                      // instruction vide : ignorée
+    char *t = slice(text, l);
+    const char *kws[] = {"then", "else", "do", NULL};
+    for (int k = 0; kws[k]; k++) {
+        size_t kl = strlen(kws[k]);
+        if (!strncmp(t, kws[k], kl) && isspace((unsigned char)t[kl])) {
+            stmts_append(s, xstrdup(kws[k]));            // le mot-clé seul
+            stmts_push(s, t + kl);                       // puis le reste
+            free(t);
+            return;
+        }
+    }
+    stmts_append(s, t);
+}
+
+/* Coupe un texte (script ou ligne) en instructions, aux ';', aux retours
+ * à la ligne et après chaque '&'. On ne coupe PAS à l'intérieur de guillemets,
+ * de $( ) ou de `...`. Les commentaires (# jusqu'à la fin de ligne) sont ignorés.
+ * *unterminated = 1 si un guillemet / $( / ` reste ouvert. */
+static void split_statements(const char *src, Stmts *out, int *unterminated)
+{
+    Buf cur = {0};
+    char q = 0;                 // guillemet ouvert
+    int paren = 0, bt = 0;      // profondeur de $( ) ; dans des `...` ?
+    for (const char *p = src; *p; p++) {
+        char c = *p;
+        if (q) {                                          // dans des guillemets : tout est copié
+            buf_addc(&cur, c);
+            if (c == '\\' && q == '"' && p[1]) buf_addc(&cur, *++p);
+            else if (c == q) q = 0;
+            continue;
+        }
+        if (c == '\\' && p[1]) { buf_addc(&cur, c); buf_addc(&cur, *++p); continue; }
+        if (c == '\'' || c == '"') { q = c; buf_addc(&cur, c); continue; }
+        if (c == '`') { bt = !bt; buf_addc(&cur, c); continue; }
+        if (c == '$' && p[1] == '(') { paren++; buf_addc(&cur, c); buf_addc(&cur, *++p); continue; }
+        if (c == ')' && paren > 0) { paren--; buf_addc(&cur, c); continue; }
+        if (paren > 0 || bt) { buf_addc(&cur, c); continue; }   // dans $( ) ou `...` : copié
+        if (c == '#' && (cur.len == 0 || isspace((unsigned char)cur.s[cur.len - 1]))) {
+            while (p[1] && p[1] != '\n') p++;             // commentaire : saute jusqu'à la fin de ligne
+            continue;
+        }
+        if (c == ';' || c == '\n' || c == '&') {          // séparateur d'instructions
+            if (c == '&') buf_addc(&cur, c);              // le '&' reste (il signifie arrière-plan)
+            stmts_push(out, cur.s ? cur.s : "");
+            cur.len = 0;
+            if (cur.s) cur.s[0] = '\0';
+            continue;
+        }
+        buf_addc(&cur, c);
+    }
+    if (unterminated) *unterminated = (q != 0) || paren > 0 || bt;
+    stmts_push(out, cur.s ? cur.s : "");
+    free(cur.s);
+}
+
+static void stmts_free(Stmts *s)
+{
+    for (int i = 0; i < s->n; i++) free(s->v[i]);
+    free(s->v);
+    s->v = NULL;
+    s->n = s->cap = 0;
+}
+
+/* Vrai si l'instruction s commence par le mot kw (suivi d'un espace ou de la fin). */
+static int first_word_is(const char *s, const char *kw)
+{
+    size_t l = strlen(kw);
+    return !strncmp(s, kw, l) && (s[l] == '\0' || isspace((unsigned char)s[l]));
+}
+static int is_opener(const char *s) { return first_word_is(s, "if") || first_word_is(s, "for") || first_word_is(s, "while"); }
+static int is_closer(const char *s) { return first_word_is(s, "fi") || first_word_is(s, "done"); }
+
+/* Trouve le "fi" / "done" qui ferme le bloc ouvert à l'indice i (en comptant
+ * les blocs imbriqués). Renvoie -1 s'il manque. */
+static int find_end(Stmts *st, int i, int to)
+{
+    int depth = 0;
+    for (int k = i; k < to; k++) {
+        if (is_opener(st->v[k])) depth++;
+        else if (is_closer(st->v[k]) && --depth == 0) return k;
+    }
+    return -1;
+}
+/* Trouve le "else" du niveau courant entre then_idx et fi_idx (-1 s'il n'y en a pas). */
+static int find_else(Stmts *st, int then_idx, int fi_idx)
+{
+    int depth = 0;
+    for (int k = then_idx + 1; k < fi_idx; k++) {
+        if (is_opener(st->v[k])) depth++;
+        else if (is_closer(st->v[k])) depth--;
+        else if (depth == 0 && !strcmp(st->v[k], "else")) return k;
+    }
+    return -1;
+}
+
+static int syntax_error(const char *near)
+{
+    fprintf(stderr, "ocsh: erreur de syntaxe près de « %s »\n", near);
+    return last_status = 2;
+}
+
+/* Exécute les instructions st[from .. to-1].
+ * Pour if/while/for : l'ARBRE n'existe pas, on lit directement les instructions
+ * et on s'appelle récursivement sur le corps du bloc.
+ *   if COND ; then A ; else B ; fi   -> COND est une commande : code 0 = vrai
+ *   while COND ; do A ; done         -> on ré-exécute COND à chaque tour
+ *   for x in a b c ; do A ; done     -> x prend chaque valeur */
+static int exec_range(Stmts *st, int from, int to)
+{
+    int status = last_status;
+    int i = from;
+    while (i < to && !exit_requested && !interrupted) {   
+        const char *s = st->v[i];
+        if (first_word_is(s, "if")) {
+            int fi = find_end(st, i, to);
+            if (fi < 0 || i + 1 >= fi || strcmp(st->v[i + 1], "then")) return syntax_error(s);
+            int el = find_else(st, i + 1, fi);
+            int cond = exec_statement(s + 2);            // la condition est une commande normale
+            if (cond == 0)
+                status = exec_range(st, i + 2, el >= 0 ? el : fi);   // branche "then"
+            else if (el >= 0)
+                status = exec_range(st, el + 1, fi);                  // branche "else"
+            else
+                status = 0;
+            i = fi + 1;                                  // on continue après le fi
+        } else if (first_word_is(s, "while")) {
+            int done = find_end(st, i, to);
+            if (done < 0 || i + 1 >= done || strcmp(st->v[i + 1], "do")) return syntax_error(s);
+            while (!exit_requested && !interrupted && exec_statement(s + 5) == 0)   // condition ré-évaluée à chaque tour ; Ctrl+C l'arrête
+                status = exec_range(st, i + 2, done);
+            i = done + 1;
+        } else if (first_word_is(s, "for")) {
+            int done = find_end(st, i, to);
+            if (done < 0 || i + 1 >= done || strcmp(st->v[i + 1], "do")) return syntax_error(s);
+            char *e = expand(s + 3);                     // "x in a b c" avec variables remplacées
+            const char *p = e;
+            char *words[MAX_ARGS];
+            int nw = 0;
+            while (nw < MAX_ARGS) {                      // découpe en mots
+                while (isspace((unsigned char)*p)) p++;
+                if (!*p || *p == '<' || *p == '>') break;
+                words[nw++] = parse_word(&p);
+            }
+            if (nw < 2 || strcmp(words[1], "in")) {      // forme attendue : for NOM in ...
+                for (int k = 0; k < nw; k++) free(words[k]);
+                free(e);
+                return syntax_error(s);
+            }
+            for (int k = 2; k < nw && !exit_requested && !interrupted; k++) {   // Ctrl+C arrête la boucle
+                var_set(words[0], words[k], 0);          // x = valeur courante
+                status = exec_range(st, i + 2, done);    // exécute le corps
+            }
+            for (int k = 0; k < nw; k++) free(words[k]);
+            free(e);
+            i = done + 1;
+        } else if (is_closer(s) || !strcmp(s, "then") || !strcmp(s, "else") || !strcmp(s, "do")) {
+            return syntax_error(s);                      // mot-clé orphelin
+        } else {
+            status = exec_statement(s);                  // instruction ordinaire
+            i++;
+        }
+        last_status = status;   // $? = code de la dernière commande/bloc (pas celui d'une condition qui a échoué)
+    }
+    last_status = status;   
+    return status;
+}
+
+/* Exécute un texte entier (script, ligne, contenu de $( )). */
+static int run_source(const char *src)
+{
+    Stmts st = {0};
+    split_statements(src, &st, NULL);
+    int status = exec_range(&st, 0, st.n);
+    stmts_free(&st);
+    return status;
+}
+
+/* Vrai si le texte est incomplet (guillemet ou bloc if/for/while pas fermé) :
+ * dans ce cas le REPL lit une ligne de plus (prompt "...> "). */
+static int is_incomplete(const char *src)
+{
+    Stmts st = {0};
+    int unterminated = 0, depth = 0;
+    split_statements(src, &st, &unterminated);
+    for (int i = 0; i < st.n; i++) {
+        if (is_opener(st.v[i])) depth++;
+        else if (is_closer(st.v[i])) depth--;
+    }
+    stmts_free(&st);
+    return unterminated || depth > 0;
+}
+
+/* ---------- 2.G  Fichiers et boucle principale (jalons 1 et 5) ---------- */
+
+/* Lit tout un flux (fichier ou stdin) en mémoire. */
+static char *read_stream(FILE *f)
+{
+    Buf b = {0};
+    char tmp[4096];
+    size_t r;
+    while ((r = fread(tmp, 1, sizeof tmp, f)) > 0)
+        buf_addn(&b, tmp, r);
+    return buf_take(&b);
+}
+
+/* Lit ~/.ocshrc et l'exécute comme un petit script (s'il existe). */
+static void load_rc(void)
+{
+    char *path = home_file(".ocshrc");
+    FILE *f = path ? fopen(path, "r") : NULL;
+    if (f) {
+        char *src = read_stream(f);
+        fclose(f);
+        run_source(src);
+        free(src);
+    }
+    free(path);
+}
+
+/*  LE REPL : Read -> Eval -> Print -> Loop.
+ *   lecture d'une ligne -> (si incomplète : on relit) -> historique -> exécution. */
+static void interactive_loop(void)
+{
+    history_load();
+    while (!exit_requested) {
+        print_done_notices();                            // annonce les tâches de fond finies
+        interrupted = 0;
+        Buf src = {0};                                   // la commande en cours (peut tenir sur plusieurs lignes)
+        for (;;) {
+            char *line = read_line(src.len ? "...> " : "ocsh> ");
+            if (!line) {
+                if (interrupted) {                       // Ctrl+C : on abandonne la saisie
+                    interrupted = 0;
+                    last_status = 130;
+                    free(src.s);
+                    break;                               // retour au prompt
+                }
+                free(src.s);                             // Ctrl+D : fin du shell
+                exit_requested = 1;
+                exit_code = last_status;
+                break;
+            }
+            buf_add(&src, line);
+            buf_addc(&src, '\n');
+            free(line);
+            if (is_incomplete(src.s))
+                continue;                                // il manque la suite : on lit une ligne de plus
+            while (src.len && src.s[src.len - 1] == '\n') src.s[--src.len] = '\0';
+            /* historique : une commande sur plusieurs lignes est stockée sur une seule */
+            char *one = xstrdup(src.s);
+            for (char *p = one; *p; p++)
+                if (*p == '\n') *p = ';';
+            history_add(one);
+            free(one);
+            run_source(src.s);                           // EXÉCUTION
+            free(src.s);
+            break;
+        }
+    }
+    history_save();
+}
+
+/* Programme principal : choisit le mode (script, -c, interactif, stdin). */
+int main(int argc, char **argv)
+{
+    signals_setup();                                     // Ctrl+C, SIGCHLD...
+    char *src = NULL;
+    if (argc >= 3 && !strcmp(argv[1], "-c")) {           // ocsh -c 'commande'
+        src = xstrdup(argv[2]);
+    } else if (argc >= 2) {                              // ocsh script.ocsh  (mode script)
+        FILE *f = fopen(argv[1], "r");
+        if (!f) { perror(argv[1]); return 127; }
+        src = read_stream(f);
+        fclose(f);
+    } else if (isatty(STDIN_FILENO)) {                   // clavier : mode interactif
+        interactive = 1;
+        load_rc();                                       // ~/.ocshrc
+        if (!exit_requested) interactive_loop();
+    } else {                                             // stdin redirigé : echo "cmd" | ./ocsh
+        src = read_stream(stdin);
+    }
+    if (src) {                                           // modes non interactifs : tout d'un coup
+        run_source(src);
+        free(src);
+    }
+    return exit_requested ? exit_code : last_status;
+}
