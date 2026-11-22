@@ -290,7 +290,7 @@ OCSH/
 | Inas Basguit | [inasbsgt](https://github.com/inasbsgt) |
 | Ahmed Al-aabqary | [Y0kina](https://github.com/Y0kina) |
 | Sami Goumi | [akoulaaaaaaaa](https://github.com/akoulaaaaaaaa) |
-| Yasmine El baijouni | [still loading…](https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?autoplay=1) |
+| Yasmine El baijouni | [yasmine-bjjjj](https://github.com/yasmine-bjjjj) |
 
 <div align="center">
 
