@@ -2,16 +2,9 @@
 
 <img src="assets/banner.svg" alt="ocsh : mini-shell en C" width="900" />
 
+<img src="assets/badges.svg" alt="ocsh : badges du projet" width="900" />
+
 <br/>
-
-![C](https://img.shields.io/badge/langage-C-00599C?style=for-the-badge&logo=c&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
-![Builtins](https://img.shields.io/badge/builtins-11-brightgreen?style=for-the-badge)
-![Alias](https://img.shields.io/badge/alias-7-blue?style=for-the-badge)
-![Job control](https://img.shields.io/badge/job%20control-jobs%20fg%20bg-8A2BE2?style=for-the-badge)
-![Dépendances](https://img.shields.io/badge/d%C3%A9pendances-libc%20uniquement-red?style=for-the-badge)
-
-**Projet 3 · Systèmes d'Exploitation · UIR / ESIN**
 
 <img src="assets/demo.svg" alt="ocsh en action" width="760" />
 
@@ -275,6 +268,7 @@ OCSH/
 ├── demo.mp4         vidéo de démonstration
 └── assets/          animations du README
     ├── banner.svg
+    ├── badges.svg
     ├── demo.svg
     ├── equiv.svg
     ├── fork.svg
