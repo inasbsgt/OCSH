@@ -54,7 +54,7 @@ Le prompt `ocsh>` s'affiche. Pour quitter : `quit` ou **Ctrl+D**.
 | Mode interactif | `./ocsh` |
 | Une seule commande | `./ocsh -c 'say bonjour'` |
 | Exécuter un script | `./ocsh script.ocsh` |
-| Lire depuis l'entrée standard | `echo "say salut" \| ./ocsh` |
+| Lire depuis l'entrée standard | `echo "say hello" \| ./ocsh` |
 | Compiler et lancer | `make run` |
 | Nettoyer | `make clean` |
 
